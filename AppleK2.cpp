@@ -247,7 +247,7 @@ IOService * AppleK2::createNub( IORegistryEntry * from )
 void AppleK2::turnOffK2IO(bool restart)
 {
 	UInt32				regTemp;
-	IOInterruptState	intState;
+	IOInterruptState	intState = NULL;
 	
 	/*
 	 * When we are called, PMU has already been signalled to initiate sleep and only
@@ -438,7 +438,7 @@ void AppleK2::restoreRegisterState(void)
 
 void AppleK2::safeWriteRegUInt32(unsigned long offset, UInt32 mask, UInt32 data)
 {
-	IOInterruptState intState;
+	IOInterruptState intState= NULL;
 
 	if ( mutex  != NULL )
 		intState = IOSimpleLockLockDisableInterrupt(mutex);
@@ -631,11 +631,26 @@ void AppleK2::saveK2State(void)
     savedK2MPICState->mpicSpuriousVector = *(UInt32 *)(mpicBaseAddr + kKeyLargoMPICSpuriousVector);
     savedK2MPICState->mpicTimerFrequencyReporting = *(UInt32 *)(mpicBaseAddr + kKeyLargoMPICTimeFreq);
 
-    savedK2MPICState->mpicTimers[0] = *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase0);
-    savedK2MPICState->mpicTimers[1] = *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase1);
-    savedK2MPICState->mpicTimers[2] = *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase2);
-    savedK2MPICState->mpicTimers[3] = *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase3);
-
+    // [4101414] timer registers in KeyLargo are on 16byte boundaries
+    UInt32 timerAddresses[kKeyLargoMPICTimerCount] = {kKeyLargoMPICTimerBase0,
+                                                      kKeyLargoMPICTimerBase1,
+                                                      kKeyLargoMPICTimerBase2,
+                                                      kKeyLargoMPICTimerBase3};
+    UInt32 *MPICRegPtr;
+    MPICTimers *SavedMPICReg;
+    
+    for (i = 0; i < kKeyLargoMPICTimerCount; i++)
+    {
+        SavedMPICReg = &savedK2MPICState->mpicTimers[i];
+        MPICRegPtr = (UInt32 *)(mpicBaseAddr + timerAddresses[i] - 0x10);   
+        // ???BaseX - 0x10 == CurrentCountRegister
+        
+        SavedMPICReg->currentCountRegister = *(MPICRegPtr + 0);
+        SavedMPICReg->baseCountRegister = *(MPICRegPtr + 0x4);
+        SavedMPICReg->vectorPriorityRegister = *(MPICRegPtr + 0x8);
+        SavedMPICReg->destinationRegister = *(MPICRegPtr + 0xc);
+    }
+	
     for (i = 0; i < kKeyLargoMPICVectorsCount; i++)
     {
         // Make sure that the "active" bit is cleared.
@@ -694,14 +709,25 @@ void AppleK2::restoreK2State(void)
     *(UInt32 *)(mpicBaseAddr + kKeyLargoMPICTimeFreq) = savedK2MPICState->mpicTimerFrequencyReporting;
     eieio();
 
-    *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase0) = savedK2MPICState->mpicTimers[0];
-    eieio();
-    *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase1) = savedK2MPICState->mpicTimers[1];
-    eieio();
-    *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase2) = savedK2MPICState->mpicTimers[2];
-    eieio();
-    *(MPICTimers *)(mpicBaseAddr + kKeyLargoMPICTimerBase3) = savedK2MPICState->mpicTimers[3];
-    eieio();
+    // [4101414] timer registers in KeyLargo are on 16byte boundaries
+    UInt32 timerAddresses[kKeyLargoMPICTimerCount] = {kKeyLargoMPICTimerBase0,
+                     			             kKeyLargoMPICTimerBase1,
+                     			             kKeyLargoMPICTimerBase2,
+                     			             kKeyLargoMPICTimerBase3};
+    UInt32 *MPICRegPtr;
+    MPICTimers *savedMPICReg;
+    
+    for (i = 0; i < kKeyLargoMPICTimerCount; i++)
+    {
+        savedMPICReg = &savedK2MPICState->mpicTimers[i];
+        MPICRegPtr = (UInt32 *)(mpicBaseAddr + timerAddresses[i] - 0x10);   
+        // ???BaseX - 0x10 == CurrentCountRegister
+        
+         *(MPICRegPtr + 0x0) = savedMPICReg->currentCountRegister;   eieio();
+         *(MPICRegPtr + 0x4) = savedMPICReg->baseCountRegister;     eieio();
+         *(MPICRegPtr + 0x8) = savedMPICReg->vectorPriorityRegister;    eieio();
+         *(MPICRegPtr + 0xc) = savedMPICReg->destinationRegister;   eieio();
+    }
 
     for (i = 0; i < kKeyLargoMPICVectorsCount; i++)
     {
@@ -1053,7 +1079,7 @@ IOReturn AppleK2::callPlatformFunction(const OSSymbol *functionName,
 void AppleK2::EnableSCC(bool state, UInt8 device, bool type)
 {
     UInt32 bitsToSet, bitsToClear, currentReg, currentReg3, currentReg5;
-    IOInterruptState intState;
+    IOInterruptState intState= NULL;
 		
 	bitsToSet = bitsToClear = currentReg = currentReg3 = currentReg5 = 0;
 	
@@ -1176,9 +1202,10 @@ void AppleK2::PowerModem(bool state)
     }
     prop = (OSData *) fProvider->getProperty( "platform-modem-power" );
     if(prop && fPHandle) {
-        char callName[255];
+        char callName[32];
 		IOReturn res;
-        sprintf(callName,"%s-%8lx", "platform-modem-power", fPHandle);
+		// "platform-modem-power" = 20 chars + "-%8lx" is a max of 9 chars, yielding a max of 29+1 (EOS) or 30 chars
+        snprintf(callName, sizeof(callName), "%s-%8lx", "platform-modem-power", fPHandle);
         res = IOService::callPlatformFunction(callName, false, (void*) state, 0, 0, 0  );
     }
     else {
@@ -1198,9 +1225,10 @@ void AppleK2::ModemResetLow()
     OSData *prop;
     prop = (OSData *) fProvider->getProperty( "platform-modem-reset" );
     if(prop && fPHandle) {
-        char callName[255];
+        char callName[32];
 		IOReturn res;
-        sprintf(callName,"%s-%8lx", "platform-modem-reset", fPHandle);
+		// "platform-modem-reset" = 20 chars + "-%8lx" is a max of 9 chars, yielding a max of 29+1 (EOS) or 30 chars
+        snprintf(callName, sizeof( callName ), "%s-%8lx", "platform-modem-reset", fPHandle);
         res = IOService::callPlatformFunction(callName, false, (void*) false, 0, 0, 0  );
     }
     else {
@@ -1217,9 +1245,10 @@ void AppleK2::ModemResetHigh()
     OSData *prop;
     prop = (OSData *) fProvider->getProperty( "platform-modem-reset" );
     if(prop && fPHandle) {
-        char callName[255];
+        char callName[32];
 		IOReturn res;
-        sprintf(callName,"%s-%8lx", "platform-modem-reset", fPHandle);
+		// "platform-modem-reset" = 20 chars + "-%8lx" is a max of 9 chars, yielding a max of 29+1 (EOS) or 30 chars
+        snprintf(callName, sizeof( callName ), "%s-%8lx", "platform-modem-reset", fPHandle);
         res = IOService::callPlatformFunction(callName, false, (void*)true, 0, 0, 0  );
     }
     else {
